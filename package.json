@@ -1,0 +1,29 @@
+{
+  "name": "rea-ui",
+  "version": "1.0.0",
+  "description": "Graphical front-end for the REA reverse-engineering CLI (morluto/rea). Windows portable build with all 153 commands schema-generated.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/OWNER/rea-ui.git"
+  },
+  "keywords": [
+    "reverse-engineering",
+    "ghidra",
+    "mcp",
+    "agent",
+    "analysis",
+    "electron",
+    "dotnet"
+  ],
+  "scripts": {
+    "start": "node server.mjs",
+    "build:catalog": "node tools/build-catalog.mjs",
+    "build:portable": "node tools/build-portable.mjs",
+    "build:index": "node tools/build-index.mjs"
+  },
+  "dependencies": {
+    "rea-agents": "^6.5.0"
+  }
+}

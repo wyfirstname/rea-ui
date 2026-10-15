@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>REA UI</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+<link rel="stylesheet" href="/app.css" />
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark">REA</div>
+      <div class="brand-text">
+        <strong>REA UI</strong>
+        <span id="catalogMeta">载入中…</span>
+      </div>
+    </div>
+
+    <nav class="tabs" role="tablist">
+      <button class="tab active" data-view="panel" role="tab">命令面板</button>
+      <button class="tab" data-view="chat" role="tab">对话式</button>
+      <button class="tab" data-view="env" role="tab">环境</button>
+    </nav>
+
+    <div class="search-wrap">
+      <input id="search" type="search" placeholder="搜索命令或说明…" autocomplete="off" />
+    </div>
+
+    <div id="cmdList" class="cmd-list"></div>
+
+    <div class="sidebar-foot">
+      <span id="reaStatus" class="dot"></span>
+      <span id="reaStatusText">检测中…</span>
+    </div>
+  </aside>
+
+  <main class="main">
+    <!-- ================= 参数面板 ================= -->
+    <section id="view-panel" class="view active">
+      <header class="view-head">
+        <div>
+          <h1 id="cmdTitle">选择一个命令</h1>
+          <p id="cmdDesc" class="muted">左侧列表按目标类型分组，共 153 个命令。</p>
+        </div>
+        <div class="head-actions">
+          <span id="engineBadge" class="badge hidden"></span>
+        </div>
+      </header>
+
+      <div id="formHost" class="form-host">
+        <div class="empty">
+          <p>从左侧选择一个命令开始。</p>
+          <p class="muted small">表单由命令自身的 JSON Schema 自动生成，覆盖全部 153 个命令。</p>
+        </div>
+      </div>
+
+      <div class="run-bar">
+        <div class="run-preview">
+          <code id="argvPreview">rea</code>
+        </div>
+        <button id="runBtn" class="primary" disabled>运行</button>
+        <button id="stopBtn" class="ghost hidden">停止</button>
+      </div>
+
+      <section class="output">
+        <div class="out-head">
+          <div class="out-tabs">
+            <button class="out-tab active" data-out="result">结果</button>
+            <button class="out-tab" data-out="evidence">证据链</button>
+            <button class="out-tab" data-out="raw">原始输出</button>
+          </div>
+          <div class="out-tools">
+            <span id="statusChip" class="chip">就绪</span>
+            <button id="copyBtn" class="ghost small-btn">复制结果</button>
+            <button id="saveBtn" class="ghost small-btn">保存 JSON</button>
+          </div>
+        </div>
+        <pre id="progress" class="progress hidden"></pre>
+        <pre id="output" class="out-body">尚未运行。</pre>
+      </section>
+    </section>
+
+    <!-- ================= 对话式 ================= -->
+    <section id="view-chat" class="view">
+      <header class="view-head">
+        <div>
+          <h1>对话式</h1>
+          <p class="muted">用自然语言描述目标，助手会挑选并运行 REA 命令。</p>
+        </div>
+        <div class="head-actions">
+          <button id="cfgBtn" class="ghost small-btn">模型设置</button>
+          <button id="clearChat" class="ghost small-btn">清空</button>
+        </div>
+      </header>
+
+      <div id="chatLog" class="chat-log">
+        <div class="msg assistant">
+          告诉我你想分析什么，例如「分析 E:/path/to/app 的 Electron 模块结构」，
+          我会调用 REA 给出带证据的结论。需要我调用 REA 时，会输出一个 rea 代码块。
+        </div>
+      </div>
+
+      <div class="chat-input">
+        <textarea id="chatText" rows="2" placeholder="描述你的分析目标…（Enter 发送，Shift+Enter 换行）"></textarea>
+        <button id="sendBtn" class="primary">发送</button>
+      </div>
+    </section>
+
+    <!-- ================= 环境 ================= -->
+    <section id="view-env" class="view">
+      <header class="view-head">
+        <div>
+          <h1>环境与能力</h1>
+          <p class="muted">REA 自身不做逆向，需要外部引擎。以下是本机实际可用能力。</p>
+        </div>
+        <div class="head-actions">
+          <button id="refreshEnv" class="ghost small-btn">刷新</button>
+        </div>
+      </header>
+      <div id="envBody" class="env-body"></div>
+    </section>
+  </main>
+</div>
+
+<!-- 模型设置 -->
+<div id="cfgModal" class="modal hidden">
+  <div class="modal-card">
+    <h2>模型设置</h2>
+    <p class="muted small">对话式面板需要一个 OpenAI 兼容的接口。配置仅保存在本机浏览器。</p>
+    <label>Base URL<input id="cfgBase" placeholder="https://api.openai.com/v1" /></label>
+    <label>API Key<input id="cfgKey" type="password" placeholder="sk-…" /></label>
+    <label>模型<input id="cfgModel" placeholder="gpt-4o-mini" /></label>
+    <div class="modal-actions">
+      <button id="cfgSave" class="primary">保存</button>
+      <button id="cfgCancel" class="ghost">取消</button>
+    </div>
+  </div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>
