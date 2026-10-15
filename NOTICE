@@ -1,0 +1,14 @@
+REA UI — third-party notices
+=========================
+
+This project is a third-party graphical front-end for REA
+(https://github.com/morluto/rea), which is licensed under the MIT License
+and copyright its respective authors. REA itself is not included in this
+repository; it is installed as an npm dependency at build time.
+
+Reverse engineering tools referenced by REA (IDA, Hopper, JEB, Ghidra, JADX)
+are third-party products and are NOT distributed here. You must obtain and
+license them separately under their own terms. In particular, commercial
+decompilers such as IDA Pro and Hopper require a valid commercial license.
+
+Use this tool only on software you own or are authorized to examine.
