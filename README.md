@@ -280,6 +280,20 @@ PDB 没被加载。Ghidra 能读取**目标文件同目录下的 `.pdb`**,
 
 ---
 
+## 博文
+
+项目介绍文章见 [`blog/REA-UI-介绍.md`](blog/REA-UI-介绍.md)，
+自包含的 HTML 版本（含 base64 内嵌截图，可离线浏览）见
+[`blog/REA-UI-介绍.html`](blog/REA-UI-介绍.html)。
+
+重新生成 HTML：
+
+```bash
+node tools/build-blog-html.mjs
+```
+
+---
+
 ## 支持
 
 如果你觉得这个工具省了时间,欢迎赞助一杯咖啡 ☕
