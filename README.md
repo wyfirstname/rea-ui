@@ -2,11 +2,26 @@
 
 REA (Reverse Engineer Anything) 的图形界面封装。**解压即用,不需要装 Node。**
 
-REA 是 [morluto/rea](https://github.com/morluto/rea) —— 一个 24 万星的开源项目,
+REA 是 [morluto/rea](https://github.com/morluto/rea) —— 一个 20 万星的开源项目,
 让 AI Agent 逆向分析一切,从应用行为一路深入到原生二进制。
 本项目给它做了一套 Web 界面,并打包成 Windows 免安装绿色版。
 
 **153 个命令的表单全部自动生成**,不是手工维护的 —— 原理见下文「工作原理」。
+
+---
+
+## 下载
+
+绿色包是约 62 MB 的免安装 zip。**用手机扫码阅读公众号文章,文末即是下载地址:**
+
+<table>
+<tr>
+<td align="center"><img src="assets/qrcode-green-package.png" width="260" alt="公众号文章二维码:获取绿色安装包"><br><b>扫码获取绿色安装包</b></td>
+</tr>
+</table>
+
+在电脑上阅读,直接打开这篇文章即可:
+<https://mp.weixin.qq.com/s/EprMLmF2G-krsqQGI8psfg>
 
 ---
 
@@ -68,7 +83,7 @@ REA 的 CLI 自带 introspection,这是本项目能覆盖全部命令的关键:
 
 ### 步骤
 
-1. 下载 `REA-UI-green.zip` 并解压到任意目录(路径含中文或空格也可以)
+1. 下载 `REA-UI-green.zip`(获取方式见上文「下载」)并解压到任意目录(路径含中文或空格也可以)
 2. 双击 **`启动 REA UI.bat`**
 3. 浏览器自动打开 `http://127.0.0.1:7823`
 
