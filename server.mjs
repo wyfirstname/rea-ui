@@ -8,11 +8,12 @@
 //    {"rea_progress":{...}} objects on stdout, which we forward to the browser.
 //  - Every invocation is an isolated child process; nothing is cached between
 //    runs, matching the CLI's own "each invocation is a separate process" model.
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { createReadStream, existsSync, readFileSync, statSync } from "node:fs";
 import { createServer } from "node:http";
 import { extname, join, normalize, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { homedir } from "node:os";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = join(here, "public");
@@ -32,9 +33,72 @@ function resolveReaBin() {
   return null;
 }
 
+/** Locate Ghidra and a JDK, reusing inherited values when they are usable. */
+function resolveEngineEnv() {
+  const env = { ...process.env };
+  const headless = (p) => join(p, "support", "analyzeHeadless.bat");
+
+  if (!env.GHIDRA_INSTALL_DIR || !existsSync(headless(env.GHIDRA_INSTALL_DIR))) {
+    for (const p of [
+      "D:/rea/ghidra",
+      "C:/ghidra",
+      "C:/tools/ghidra",
+      "D:/ghidra",
+      "D:/tools/ghidra",
+      join(homedir(), "ghidra"),
+      join(process.env.ProgramFiles || "C:/Program Files", "ghidra"),
+    ]) {
+      if (existsSync(headless(p))) {
+        env.GHIDRA_INSTALL_DIR = p;
+        break;
+      }
+    }
+  }
+
+  // A JDK 8 JAVA_HOME is common and makes REA reject every native request.
+  const javac = (p) => p && existsSync(join(p, "bin", "javac.exe"));
+  const major = (p) => {
+    try {
+      const out = execFileSync(join(p, "bin", "java.exe"), ["-version"], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      return /version "(\d+)/.exec(out)?.[1] || "";
+    } catch (e) {
+      return /version "(\d+)/.exec(e.stderr || "")?.[1] || "";
+    }
+  };
+  if (!javac(env.JAVA_HOME) || Number(major(env.JAVA_HOME)) < 21) {
+    for (const p of [
+      "D:/rea/jdk",
+      "C:/Program Files/Java/jdk-21",
+      "C:/Program Files/Java/jdk-25",
+      "C:/Program Files/Eclipse Adoptium/jdk-21",
+      join(homedir(), ".jdks"),
+    ]) {
+      if (javac(p)) {
+        env.JAVA_HOME = p;
+        break;
+      }
+    }
+  }
+  if (env.JAVA_HOME && existsSync(join(env.JAVA_HOME, "bin"))) {
+    env.PATH = join(env.JAVA_HOME, "bin") + ";" + (env.PATH || "");
+  }
+  return env;
+}
+
 const REA_BIN = resolveReaBin();
 const HOST = process.env.REA_UI_HOST || "127.0.0.1";
 const PORT = Number(process.env.REA_UI_PORT || 7823);
+
+// REA shells out to Ghidra, which needs both of these in the child
+// environment. The launcher sets them for the server process, but anything
+// spawned from here must not depend on an inherited PATH lookup — probe for the
+// engine once and pass an explicit env to every child. Without this the
+// conversational panel receives `provider_unavailable` instead of a result
+// whenever the server was started without the launcher's environment.
+const ENGINE_ENV = resolveEngineEnv();
 
 const MIME = {
   ".html": "text/html; charset=utf-8",
@@ -116,26 +180,51 @@ export function buildArgs(command, args = {}, options = {}) {
   const argv = [];
   const argSchema = command.args?.properties || {};
   const optSchema = command.options?.properties || {};
-  const order = command.args?.required || Object.keys(argSchema);
+  // Positional order follows the schema's own property order, which mirrors the
+  // CLI signature. Iterating `required` only would silently drop *optional*
+  // positionals such as `decompile <path> [address]`, so a user-supplied
+  // address would never reach the engine and the command would fail with
+  // "missing_argument". Required keys are emitted first, then any remaining
+  // optional positionals, both in declaration order.
+  const required = command.args?.required || [];
+  const declared = Object.keys(argSchema);
+  const order = [
+    ...required.filter((k) => declared.includes(k)),
+    ...declared.filter((k) => !required.includes(k)),
+  ];
 
+  const emittedPositional = new Set();
   for (const key of order) {
     const v = coerce(args[key], argSchema[key]);
     if (v === undefined) continue;
     if (Array.isArray(v)) argv.push(...v);
     else argv.push(String(v));
+    emittedPositional.add(key);
   }
   for (const [key, raw] of Object.entries(options)) {
     const schema = optSchema[key];
     if (!schema) continue;
+    // Some keys exist as both a positional and a flag (search.pattern,
+    // xrefs.address, trace.query). When the positional already carries a value,
+    // skip the flag so the engine does not receive the selector twice.
+    if (emittedPositional.has(key)) continue;
+    // `--json` is owned by the run layer, which always appends it to request a
+    // structured envelope. A command may also declare its own `--json`
+    // (cutter-command does), so emitting it from the form would duplicate the
+    // flag; the runner's flag already covers it.
+    if (toKebab(key) === "json") continue;
     const v = coerce(raw, schema);
     if (v === undefined) continue;
     const flag = `--${toKebab(key)}`;
     if (typeof v === "boolean") {
       if (v) argv.push(flag);
     } else if (Array.isArray(v)) {
-      for (const item of v) argv.push(flag, String(item));
+      // Repeat the flag. The "=" form attaches each value to its flag so a
+      // value beginning with "-" is never parsed as another option — exactly
+      // the case the CLI documents as needing --procedure=<value>.
+      for (const item of v) argv.push(`${flag}=${String(item)}`);
     } else {
-      argv.push(flag, String(v));
+      argv.push(`${flag}=${String(v)}`);
     }
   }
   return argv;
@@ -153,6 +242,99 @@ function loadCatalog() {
 function findCommand(name) {
   const cat = loadCatalog();
   return cat.commands.find((c) => c.name === name) || null;
+}
+
+// ---------------------------------------------------------------------------
+// Run tracking: stage reporting and cancellation
+// ---------------------------------------------------------------------------
+
+// Every run gets an id so the browser can cancel a specific child. The map also
+// lets /api/cancel reach processes started by a request that has since closed.
+const activeRuns = new Map();
+let runSeq = 0;
+
+/** Kill a process and everything it spawned (REA -> cmd -> java/Ghidra). */
+function killTree(pid) {
+  return new Promise((resolvePromise) => {
+    if (!pid) return resolvePromise(false);
+    try {
+      const killer = spawn("taskkill", ["/PID", String(pid), "/T", "/F"], {
+        windowsHide: true,
+        stdio: "ignore",
+      });
+      killer.on("close", () => resolvePromise(true));
+      killer.on("error", () => resolvePromise(false));
+    } catch {
+      resolvePromise(false);
+    }
+  });
+}
+
+// Enumerate processes with their parent so we can walk down from our own child
+// and find the Ghidra engine. `analyze` prints nothing while it works, so the
+// process tree is the only honest progress signal available.
+function listProcesses() {
+  return new Promise((resolvePromise) => {
+    let ps;
+    try {
+      ps = spawn("wmic", ["process", "get", "Name,ProcessId,ParentProcessId,WorkingSetSize", "/format:csv"], {
+        windowsHide: true,
+      });
+    } catch {
+      return resolvePromise(null);
+    }
+    let out = "";
+    ps.stdout.on("data", (d) => (out += d));
+    ps.on("error", () => resolvePromise(null));
+    ps.on("close", () => {
+      if (!out.trim()) return resolvePromise(null);
+      const lines = out.split(/\r?\n/).filter((l) => l.trim());
+      if (lines.length < 2) return resolvePromise(null);
+      const header = lines[0].split(",").map((h) => h.trim().toLowerCase());
+      const iName = header.indexOf("name");
+      const iPid = header.indexOf("processid");
+      const iPpid = header.indexOf("parentprocessid");
+      const iWs = header.indexOf("workingsetsize");
+      if (iName < 0 || iPid < 0) return resolvePromise(null);
+      const rows = [];
+      for (const line of lines.slice(1)) {
+        const c = line.split(",");
+        const pid = Number(c[iPid]);
+        if (!pid) continue;
+        rows.push({
+          name: (c[iName] || "").trim(),
+          pid,
+          ppid: Number(c[iPpid]) || 0,
+          ws: Number(c[iWs]) || 0,
+        });
+      }
+      resolvePromise(rows);
+    });
+  });
+}
+
+/** Deepest java.exe running under `rootPid`, or null while it has not started. */
+function findEngineUnder(rows, rootPid) {
+  const children = new Map();
+  for (const p of rows) {
+    if (!children.has(p.ppid)) children.set(p.ppid, []);
+    children.get(p.ppid).push(p);
+  }
+  const stack = [rootPid];
+  const seen = new Set([rootPid]);
+  let engine = null;
+  while (stack.length) {
+    const cur = stack.pop();
+    for (const k of children.get(cur) || []) {
+      if (seen.has(k.pid)) continue;
+      seen.add(k.pid);
+      // Ghidra starts a small launcher JVM before the real one; the engine is
+      // whichever java.exe holds the most memory.
+      if (/^javaw?\.exe$/i.test(k.name) && (!engine || k.ws > engine.ws)) engine = k;
+      stack.push(k.pid);
+    }
+  }
+  return engine;
 }
 
 // ---------------------------------------------------------------------------
@@ -177,17 +359,83 @@ async function handleRunApi(req, res, body) {
     "x-accel-buffering": "no",
   });
 
-  const child = spawn(process.execPath, argv, { windowsHide: true });
+  const child = spawn(process.execPath, argv, { windowsHide: true, env: ENGINE_ENV });
   let finished = false;
+  const runId = `run-${++runSeq}`;
+  const startedAt = Date.now();
+  activeRuns.set(runId, child);
   // stdout carries the result envelope and progress objects; REA writes them as
   // newline-delimited JSON but does not guarantee one write per line, so partial
   // lines must be buffered until the next newline arrives.
   let stdoutBuf = "";
+  let currentStage = "启动 REA 进程";
+  let currentDetail = `rea ${command}`;
 
   const emit = (event, data) => {
     if (finished) return;
     res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
   };
+
+  emit("started", { runId, command, pid: child.pid, startedAt });
+  emit("stage", { stage: currentStage, detail: currentDetail, elapsedMs: 0 });
+
+  const setStage = (stage, detail) => {
+    currentStage = stage;
+    currentDetail = detail;
+    emit("stage", { stage, detail, elapsedMs: Date.now() - startedAt });
+  };
+
+  // Not every command reports progress: `analyze` on a large binary produces
+  // no rea_progress objects at all, so the UI would sit silent for a minute or
+  // more and look hung. Emit a periodic heartbeat so the client can show
+  // elapsed time and confirm the process is alive.
+  const heartbeat = setInterval(() => {
+    if (finished) return;
+    emit("tick", {
+      elapsedMs: Date.now() - startedAt,
+      stage: currentStage,
+      note: currentDetail,
+    });
+  }, 3000);
+
+  // Stage 2 signal: watch for the Ghidra java.exe that REA spawns underneath
+  // this child. Its presence (and memory footprint) proves the engine is
+  // actually working even though nothing is printed. Updates are throttled:
+  // a JVM's memory moves every sample, and one line per 2.5s would flood the
+  // log instead of informing anyone.
+  let engineSeen = false;
+  let lastEngineNote = "";
+  let lastEngineEmit = 0;
+  let lastEngineMb = 0;
+  const engineWatch = setInterval(async () => {
+    if (finished) return;
+    const rows = await listProcesses();
+    if (!rows || finished) return;
+    const engine = findEngineUnder(rows, child.pid);
+    if (engine) {
+      engineSeen = true;
+      const mb = engine.ws / 1048576;
+      const grew = Math.abs(mb - lastEngineMb) >= Math.max(20, lastEngineMb * 0.08);
+      const stale = Date.now() - lastEngineEmit >= 8000;
+      const note = `java.exe PID ${engine.pid}，内存 ${mb.toFixed(0)} MB`;
+      if (note !== lastEngineNote && (grew || stale)) {
+        lastEngineNote = note;
+        lastEngineMb = mb;
+        lastEngineEmit = Date.now();
+        setStage("Ghidra 引擎分析中", note);
+      }
+    } else if (engineSeen) {
+      setStage("整理结果", "引擎已退出，正在汇总证据");
+    }
+  }, 2500);
+
+  const stopWatchers = () => {
+    clearInterval(heartbeat);
+    clearInterval(engineWatch);
+    activeRuns.delete(runId);
+  };
+  child.once("close", stopWatchers);
+  child.once("error", stopWatchers);
 
   const handleLine = (line) => {
     const t = line.trim();
@@ -246,24 +494,75 @@ async function handleRunApi(req, res, body) {
     // remainder (and the done event itself) would be dropped.
     if (stdoutBuf.trim()) handleLine(stdoutBuf);
     if (stderrBuf.trim()) emit("stderr", { line: stderrBuf.trim() });
+    emit("stage", {
+      stage: code === 0 ? "完成" : `结束（退出码 ${code}）`,
+      detail: `总耗时 ${((Date.now() - startedAt) / 1000).toFixed(1)} 秒`,
+      elapsedMs: Date.now() - startedAt,
+    });
     emit("done", { exitCode: code });
     finished = true;
     res.end();
   });
 
+  // Closing the browser tab / aborting the fetch must take the whole tree down,
+  // otherwise java.exe (Ghidra) keeps running on a binary nobody is waiting for.
   req.on("close", () => {
-    if (!finished && !child.killed) child.kill();
+    if (!finished) killTree(child.pid);
   });
 }
 
 // Minimal tool loop for the conversational panel: the model may ask to run a REA
 // command, we execute it and hand the (trimmed) result back as a tool message.
+const REA_FENCE_OPEN = String.fromCharCode(96,96,96) + "rea";
+const REA_FENCE_CLOSE = String.fromCharCode(96,96,96);
+const REA_VERB = "rea ";
+
+// Rounds are the runaway risk: an unaided model keeps "refining" results with
+// near-identical commands until the budget is gone. The prompt states the budget
+// and every tool result repeats how many rounds remain.
+const MAX_ROUNDS = 10;
+
 async function handleChatApi(req, res, body) {
   const { messages, apiKey, baseUrl, model } = body;
   if (!Array.isArray(messages) || !messages.length) {
     return sendJson(res, 400, { error: "messages is required" });
   }
   if (!apiKey) return sendJson(res, 400, { error: "apiKey is required" });
+
+  // A conversational answer can take several minutes (each REA command
+  // re-imports the binary into Ghidra). With stream:true the browser receives
+  // round/command progress as it happens instead of staring at "thinking…".
+  const streaming = body.stream === true;
+  let sseOpen = false;
+  const emitChat = (event, data) => {
+    if (!streaming || !sseOpen) return;
+    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  };
+  if (streaming) {
+    res.writeHead(200, {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache",
+      connection: "keep-alive",
+      "x-accel-buffering": "no",
+    });
+    sseOpen = true;
+  }
+  const finishChat = (payload) => {
+    if (streaming) {
+      emitChat("chat_final", payload);
+      res.end();
+    } else {
+      sendJson(res, 200, payload);
+    }
+  };
+  const failChat = (message) => {
+    if (streaming) {
+      emitChat("chat_error", { error: message });
+      res.end();
+    } else {
+      sendJson(res, 502, { error: message });
+    }
+  };
 
   const cat = loadCatalog();
   const toolList = cat.commands
@@ -281,7 +580,17 @@ async function handleChatApi(req, res, body) {
     "You are the assistant inside REA UI, a graphical front-end for the REA reverse-engineering CLI.",
     "You can run REA commands by replying with a fenced ```rea block containing one command line.",
     "Use absolute Windows paths. Only one command per block. Wait for the result before the next command.",
-    "Cite evidence from the tool result; state limitations explicitly.",
+    "",
+    "Rules that make you useful rather than busy:",
+    `- You have a hard budget of ${MAX_ROUNDS} command executions, then you must answer. Each result tells you how many rounds are left.`,
+    "- COST: every native command re-imports and re-analyses the target; on a 50 MB binary that is 60-90 s. So the total should normally be 2 commands, not 6.",
+    "- Do NOT run `analyze` first out of habit: a `search` already performs the full analysis. Start with the command that yields what the user asked for.",
+    "- To list every procedure, use `search <path> --kind procedures --mode regex --pattern .` — a literal `*` matches nothing useful.",
+    "- `decompile`, `function`, `instructions` and `xrefs` need a selector: `decompile <path> --procedure=<name-or-address>`. Without it REA answers invalid_request and nothing is decompiled.",
+    "- Never run the same command twice, and never refine a result you already have with another near-identical query.",
+    "- When the budget says 0 rounds are left, answer immediately from the data you already hold.",
+    "- The user cannot see the raw JSON: always answer in Chinese prose, and list concrete findings (function names, addresses, counts).",
+    "- State explicitly when a finding is not available rather than guessing.",
     "",
     "Available REA commands:",
     toolList,
@@ -290,7 +599,10 @@ async function handleChatApi(req, res, body) {
   const endpoint = `${(baseUrl || "https://api.openai.com/v1").replace(/\/$/, "")}/chat/completions`;
   const messagesForApi = [{ role: "system", content: system }, ...messages];
 
-  try {
+  // One model turn. Reasoning models (e.g. deepseek-*-Flash on SiliconFlow) spend
+  // completion tokens on hidden reasoning, so the cap must be generous or the
+  // visible answer arrives empty with finish_reason=length.
+  const callModel = async () => {
     const upstream = await fetch(endpoint, {
       method: "POST",
       headers: {
@@ -301,23 +613,228 @@ async function handleChatApi(req, res, body) {
         model: model || "gpt-4o-mini",
         messages: messagesForApi,
         temperature: 0.2,
+        max_tokens: 8000,
         stream: false,
       }),
     });
-    const data = await upstream.json();
-    if (!upstream.ok) {
-      return sendJson(res, 502, { error: data?.error?.message || `HTTP ${upstream.status}` });
+    let data;
+    try {
+      data = await upstream.json();
+    } catch {
+      throw new Error(`模型接口返回了非 JSON 响应 (HTTP ${upstream.status})`);
     }
-    sendJson(res, 200, { reply: data.choices?.[0]?.message?.content || "" });
+    if (!upstream.ok) {
+      throw new Error(data?.error?.message || `模型接口 HTTP ${upstream.status}`);
+    }
+    const msg = data.choices?.[0]?.message || {};
+    const content = (msg.content || "").trim();
+    return {
+      content,
+      finish: data.choices?.[0]?.finish_reason,
+      // Some reasoning models emit the answer only in reasoning_content when the
+      // token budget is exhausted; surface it rather than returning nothing.
+      reasoning: msg.reasoning_content || "",
+    };
+  };
+
+  try {
+    // Tool loop: keep calling the model, executing any ```rea block it emits,
+    // until it replies without one or the round budget runs out. Without this
+    // the model could only *describe* a command; nothing would ever run it.
+    for (let round = 0; round < MAX_ROUNDS; round++) {
+      const remaining = MAX_ROUNDS - round - 1;
+      emitChat("chat_round", { round: round + 1, maxRounds: MAX_ROUNDS, remaining });
+      const { content: reply } = await callModel();
+      if (!reply) {
+        return finishChat({
+          reply: "（模型返回了空回复。若是推理模型，请尝试调高模型的最大输出长度，或在「模型设置」里换一个模型。）",
+          rounds: round + 1,
+        });
+      }
+      messagesForApi.push({ role: "assistant", content: reply });
+
+      const cmd = extractReaCommand(reply);
+      if (!cmd) return finishChat({ reply, rounds: round + 1 });
+
+      // Native analysis of a large binary takes minutes; the default timeout
+      // would kill it and report a spurious failure.
+      const verb = (tokenize(cmd)[1] || "").toLowerCase();
+      const slow = /^(analyze|decompile|function|search|xrefs|trace|read|inspect|report|extract)/.test(verb);
+      const cmdStarted = Date.now();
+      emitChat("chat_exec", { command: cmd, round: round + 1 });
+      let toolText;
+      try {
+        const { code, raw, stderr } = await runReaToJson(
+          tokenize(cmd).slice(1),
+          slow ? 15 * 60 * 1000 : 120000
+        );
+        toolText =
+          code === 0
+            ? compactForModel(raw, cmd)
+            : `命令退出码 ${code}\n${compactForModel(stderr || raw, cmd)}`;
+        emitChat("chat_exec_done", { command: cmd, exitCode: code, ms: Date.now() - cmdStarted });
+      } catch (e) {
+        toolText = `命令执行失败: ${String(e.message || e)}`;
+        emitChat("chat_exec_done", { command: cmd, error: String(e.message || e), ms: Date.now() - cmdStarted });
+      }
+
+      messagesForApi.push({
+        role: "user",
+        content:
+          `Result for command: ${cmd}\n---\n` +
+          toolText +
+          `\n---\n\n剩余可执行轮数: ${remaining}。` +
+          (remaining === 0
+            ? "这是最后一轮：现在直接用已有数据回答用户，不要再输出命令块。"
+            : "数据已足够就立即回答用户（中文、列出具体名称/地址）；确实还需要一步才输出下一条命令。"),
+      });
+    }
+
+    // Budget exhausted without a final answer: force one, so the user always
+    // receives prose instead of a wall of raw JSON from the last command.
+    messagesForApi.push({
+      role: "user",
+      content:
+        "执行轮数已用尽。不要再输出任何命令块，直接基于上面已有的全部工具结果，用中文回答用户最初的问题，" +
+        "列出你能确定的具体内容（名称、地址、数量），并说明哪些部分未能获取。",
+    });
+    const final = await callModel();
+    const reply =
+      final.content ||
+      final.reasoning ||
+      "轮数已用尽，但模型未给出总结。请把命令换成更具体的一条（例如指定函数名或字符串关键字）再试。";
+    return finishChat({ reply, rounds: MAX_ROUNDS + 1, forcedFinal: true });
   } catch (err) {
-    sendJson(res, 502, { error: String(err.message || err) });
+    return failChat(String(err.message || err));
   }
+}
+
+/** Pull the single ```rea ...``` command line out of a model reply. */
+export function extractReaCommand(reply) {
+  // Locate the fence by plain string search rather than a regex: the payload
+  // between the markers is arbitrary model text and needs no pattern. Accept
+  // both the ```rea opener the system prompt asks for and a bare ``` block
+  // whose first line carries the "rea" verb.
+  const lower = reply.toLowerCase();
+  let start = lower.indexOf(REA_FENCE_OPEN);
+  let from;
+  if (start >= 0) {
+    from = start + REA_FENCE_OPEN.length;
+  } else {
+    start = lower.indexOf(REA_FENCE_CLOSE + "\n");
+    if (start < 0) return null;
+    from = start + REA_FENCE_CLOSE.length;
+  }
+  const end = lower.indexOf(REA_FENCE_CLOSE, from);
+  if (end < 0) return null;
+  const lines = reply
+    .slice(from, end)
+    .split(String.fromCharCode(10))
+    .map((l) => l.trim())
+    .filter(Boolean);
+  if (!lines.length) return null;
+  // "```rea" followed by the command on its own line is the canonical form;
+  // a stray bare "rea" header line before the command is tolerated too.
+  let line = lines[0];
+  if (lines.length > 1 && /^rea:?$/i.test(line)) line = lines[1];
+  if (line.length < 3) return null;
+  // Models write either "rea analyze <path>" or just "analyze <path>" inside the
+  // block; normalise to the verb-carrying form so execution stays unambiguous.
+  return /^rea\s/i.test(line) ? line : "rea " + line;
+}
+
+/**
+ * Split a command line into argv. Model output is not shell-quoted consistently:
+ * along with "double quotes" it may use 'single quotes' or the full-width
+ * “Chinese quotes”, and a path left wrapped in any of them would be handed to
+ * the engine with stray quote characters and fail to open. All three are
+ * stripped here.
+ */
+export function tokenize(cmd) {
+  const out = [];
+  const re = /"([^"]*)"|'([^']*)'|\u201c([^\u201d]*)\u201d|\u2018([^\u2019]*)\u2019|(\S+)/g;
+  let m;
+  while ((m = re.exec(cmd))) out.push(m[1] ?? m[2] ?? m[3] ?? m[4] ?? m[5]);
+  return out;
+}
+
+/** REA JSON results can be huge; keep the useful head without flooding context. */
+function trimForModel(text, limit = 24000) {
+  const s = String(text || "");
+  if (s.length <= limit) return s;
+  const cut = s.length - limit;
+  return s.slice(0, limit) + " [truncated " + cut + " of " + s.length + " chars]";
+}
+
+/**
+ * Shrink one REA JSON envelope before it is handed to the model.
+ *
+ * A raw envelope repeats every match twice (`raw_result` == `normalized_result`),
+ * carries several KB of analysis-profile contract boilerplate and eight long
+ * limitation paragraphs. Sending that verbatim burns the context that should be
+ * holding findings, which is what made the assistant wander between rounds.
+ */
+function compactForModel(raw, cmd, limit = 28000, maxItems = 300) {
+  const text = String(raw || "");
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    return trimForModel(text, limit);
+  }
+  if (!data || typeof data !== "object" || Array.isArray(data)) return trimForModel(text, limit);
+
+  const DROP = new Set([
+    "subject", "provider", "predicate_type", "operation", "parameters", "confidence",
+    "authority", "analysis_profile", "limitations", "evidence_links", "locations",
+    "relationship_coverage", "raw_result", "normalized_result",
+  ]);
+
+  const out = {};
+  for (const k of ["subject", "predicate_type", "operation", "parameters", "confidence", "authority"]) {
+    if (data[k] !== undefined) out[k] = data[k];
+  }
+  // Keep the engine identity, not its multi-KB parameter contract.
+  if (data.provider?.id) out.provider = { id: data.provider.id, name: data.provider.name, version: data.provider.version };
+
+  const matchKeys = ["normalized_result", "raw_result", "results", "matches", "items", "entries", "procedures", "functions", "strings"];
+  const found = matchKeys.filter((k) => Array.isArray(data[k]));
+  if (found.length) {
+    // `raw_result` and `normalized_result` hold the same rows; keep one of them.
+    const key = found.find((k) => k === "normalized_result") || found[0];
+    const arr = data[key];
+    out.match_count = arr.length;
+    out[key] = arr.length > maxItems ? arr.slice(0, maxItems) : arr;
+    if (arr.length > maxItems) out.matches_truncated = `共 ${arr.length} 条，仅列出前 ${maxItems} 条`;
+  } else {
+    // Decompile-style payloads carry the artefact as a *string* (the C
+    // pseudo-code), not an array. Dropping it left the model with nothing but
+    // envelope metadata — exactly the "decompile returns no code" failure.
+    const text = typeof data.normalized_result === "string" && data.normalized_result.trim()
+      ? data.normalized_result
+      : (typeof data.raw_result?.value === "string" && data.raw_result.value.trim()
+          ? data.raw_result.value : null);
+    if (text) {
+      const cap = 12000;
+      out.result_text = text.length > cap
+        ? text.slice(0, cap) + `\n…[已截断，原文共 ${text.length} 字符]`
+        : text;
+    }
+  }
+  for (const [k, v] of Object.entries(data)) {
+    if (DROP.has(k) || Array.isArray(v)) continue;
+    if (v === null || typeof v !== "object") out[k] = v;
+  }
+
+  let json = JSON.stringify(out, null, 1);
+  if (json.length > limit) json = trimForModel(json, limit);
+  return `命令: ${cmd}\n${json}`;
 }
 
 async function runReaToJson(args, timeoutMs = 60000) {
   if (!REA_BIN) throw new Error("rea-agents not found");
   return new Promise((resolvePromise, reject) => {
-    const child = spawn(process.execPath, [REA_BIN, ...args, "--json"], { windowsHide: true });
+    const child = spawn(process.execPath, [REA_BIN, ...args, "--json"], { windowsHide: true, env: ENGINE_ENV });
     let out = "";
     let err = "";
     const timer = setTimeout(() => {
@@ -330,7 +847,9 @@ async function runReaToJson(args, timeoutMs = 60000) {
       clearTimeout(timer);
       try {
         const parsed = JSON.parse(out);
-        resolvePromise({ code, data: parsed });
+        // Keep raw too: the conversational tool loop feeds raw text back to the
+        // model, and JSON.parse succeeding must not make the text disappear.
+        resolvePromise({ code, data: parsed, raw: out, stderr: err });
       } catch {
         resolvePromise({ code, data: null, raw: out, stderr: err });
       }
@@ -378,6 +897,16 @@ const server = createServer(async (req, res) => {
       return await handleRunApi(req, res, await readBody(req));
     }
 
+    // Explicit cancel: the browser may abort the SSE fetch, but a dedicated
+    // endpoint can also tear down a run whose request already disappeared.
+    if (path === "/api/cancel" && req.method === "POST") {
+      const { runId } = await readBody(req);
+      const child = activeRuns.get(runId);
+      if (!child) return sendJson(res, 404, { ok: false, error: "run not found (already finished)" });
+      await killTree(child.pid);
+      return sendJson(res, 200, { ok: true, pid: child.pid });
+    }
+
     if (path === "/api/chat" && req.method === "POST") {
       return await handleChatApi(req, res, await readBody(req));
     }
@@ -414,16 +943,42 @@ const server = createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, HOST, () => {
-  const cat = existsSync(CATALOG_PATH) ? loadCatalog() : { commandCount: 0 };
-  console.log(`REA UI  ->  http://${HOST}:${PORT}`);
-  console.log(`commands in catalog: ${cat.commandCount || 0}`);
-  console.log(`rea binary: ${REA_BIN || "NOT FOUND"}`);
-  if (process.env.REA_UI_OPEN === "1") {
-    spawn("cmd", ["/c", "start", "", `http://${HOST}:${PORT}`], {
-      detached: true,
-      stdio: "ignore",
-      windowsHide: true,
-    }).unref();
-  }
-});
+// Bind with a retry chain: if the preferred port is taken (a previous instance
+// that was not shut down, or another app), step to the next one instead of
+// crashing. The launcher relies on this as a second safety net, since a bare
+// EADDRINUSE would close its console window before the message is readable.
+function listenWithRetry(port, attemptsLeft = 30) {
+  // Both handlers are removed before the next attempt: a failed bind leaves its
+  // own "listening" callback registered on the server object, so without this
+  // cleanup a successful retry would fire every stale callback and print one
+  // banner per attempt (with the wrong port).
+  const onListening = () => {
+    server.removeListener("error", onError);
+    const cat = existsSync(CATALOG_PATH) ? loadCatalog() : { commandCount: 0 };
+    console.log(`REA UI  ->  http://${HOST}:${port}`);
+    console.log(`commands in catalog: ${cat.commandCount || 0}`);
+    console.log(`rea binary: ${REA_BIN || "NOT FOUND"}`);
+    if (process.env.REA_UI_OPEN === "1") {
+      spawn("cmd", ["/c", "start", "", `http://${HOST}:${port}`], {
+        detached: true,
+        stdio: "ignore",
+        windowsHide: true,
+      }).unref();
+    }
+  };
+  const onError = (err) => {
+    server.removeListener("listening", onListening);
+    if (err.code === "EADDRINUSE" && attemptsLeft > 0) {
+      console.log(`port ${port} is in use, trying ${port + 1} ...`);
+      listenWithRetry(port + 1, attemptsLeft - 1);
+      return;
+    }
+    console.error(`REA UI failed to start on ${HOST}:${port} — ${err.message}`);
+    process.exitCode = 1;
+  };
+  server.once("error", onError);
+  server.once("listening", onListening);
+  server.listen(port, HOST);
+}
+
+listenWithRetry(PORT);

@@ -17,6 +17,8 @@ const state = {
   lastResult: null,
   chat: [],
   outTab: "result",
+  runId: null,
+  startedAt: null,
 };
 
 // ---------------------------------------------------------------------------
@@ -238,7 +240,10 @@ function updatePreview() {
   if (!cmd) return;
   const parts = ["rea", cmd.name];
   const argProps = cmd.args?.properties || {};
-  for (const k of cmd.args?.required || []) {
+  // Mirror the server: every positional, required or optional, is emitted in
+  // schema order (decompile/function/xrefs take an optional [address]).
+  const argKeys = Object.keys(argProps);
+  for (const k of argKeys) {
     const v = state.fields.args[k];
     if (Array.isArray(v)) parts.push(...v.map(String));
     else if (v !== undefined && v !== "") parts.push(`"${v}"`);
@@ -247,8 +252,8 @@ function updatePreview() {
     if (v === undefined || v === "") continue;
     const flag = `--${toKebab(k)}`;
     if (typeof v === "boolean") { if (v) parts.push(flag); }
-    else if (Array.isArray(v)) { for (const i of v) parts.push(flag, i); }
-    else parts.push(flag, `"${v}"`);
+    else if (Array.isArray(v)) { for (const i of v) parts.push(`${flag}=${i}`); }
+    else parts.push(`${flag}=${v}`);
   }
   $("#argvPreview").textContent = parts.join(" ");
   $("#runBtn").disabled = missingRequired();
@@ -264,17 +269,88 @@ function setStatus(text, cls = "") {
   chip.className = "chip" + (cls ? " " + cls : "");
 }
 
+// ---------------------------------------------------------------------------
+// Progress panel
+// ---------------------------------------------------------------------------
+
+// Stages are reported by the server from real signals (it polls its own child
+// process tree for the Ghidra java.exe), so the panel never shows a fabricated
+// percentage. A local 1s timer keeps the clock moving between server ticks.
+const fmtElapsed = (ms) => {
+  const secs = Math.max(0, Math.floor(ms / 1000));
+  return `${String(Math.floor(secs / 60)).padStart(2, "0")}:${String(secs % 60).padStart(2, "0")}`;
+};
+
+let elapsedTimer = null;
+
+function startElapsedTimer() {
+  clearInterval(elapsedTimer);
+  elapsedTimer = setInterval(() => {
+    if (!state.running || !state.startedAt) return;
+    const text = fmtElapsed(Date.now() - state.startedAt);
+    $("#pbTime").textContent = text;
+    // Keep the status chip in step with the card clock; server ticks alone
+    // would let it lag up to 3 seconds behind.
+    setStatus(`运行中 ${text}`, "run");
+  }, 1000);
+}
+
+function stopElapsedTimer() {
+  clearInterval(elapsedTimer);
+  elapsedTimer = null;
+}
+
+function resetProgressBox() {
+  const box = $("#progressBox");
+  box.classList.remove("hidden", "done", "cancelled");
+  $("#pbStage").textContent = "准备中…";
+  $("#pbTime").textContent = "00:00";
+  $("#pbDetail").textContent = "正在启动 REA 进程…";
+  const fill = $("#pbFill");
+  fill.className = "pb-fill indeterminate";
+  fill.style.width = "";
+  const log = $("#progress");
+  log.textContent = "";
+  log.classList.add("hidden");
+  $("#pbToggle").textContent = "详情";
+}
+
+function setStageText(stage, detail) {
+  if (stage) $("#pbStage").textContent = stage;
+  if (detail) $("#pbDetail").textContent = detail;
+}
+
+function appendLog(line) {
+  const log = $("#progress");
+  if (!line) return;
+  log.textContent += line + "\n";
+  log.scrollTop = log.scrollHeight;
+}
+
+function setProgressBar(percent) {
+  const fill = $("#pbFill");
+  if (percent == null || Number.isNaN(percent)) {
+    fill.className = "pb-fill indeterminate";
+    fill.style.width = "";
+    return;
+  }
+  fill.className = "pb-fill determinate";
+  fill.style.width = `${Math.max(0, Math.min(100, percent))}%`;
+}
+
 async function run() {
   if (state.running || !state.selected) return;
   const cmd = state.selected;
   state.running = true;
   state.lastResult = null;
+  state.runId = null;
+  state.startedAt = Date.now();
   $("#runBtn").classList.add("hidden");
   $("#stopBtn").classList.remove("hidden");
-  $("#progress").classList.remove("hidden");
-  $("#progress").textContent = "";
-  setStatus("运行中…", "run");
   $("#output").textContent = "";
+  resetProgressBox();
+  setStatus("运行中 00:00", "run");
+  startElapsedTimer();
 
   state.es = new EventSourcePlaceholder();
   state.es.open({
@@ -323,25 +399,41 @@ class EventSourcePlaceholder {
       });
   }
   handle(event, data) {
-    if (event === "progress") {
+    if (event === "started") {
+      // Keep the run id so 取消 can reach this exact child process.
+      state.runId = data.runId;
+    } else if (event === "stage") {
+      // Server-observed phase: REA child -> Ghidra java.exe -> result assembly.
+      setStageText(data.stage, data.detail);
+      if (typeof data.elapsedMs === "number") {
+        $("#pbTime").textContent = fmtElapsed(data.elapsedMs);
+      }
+      appendLog(`[阶段] ${data.stage}${data.detail ? " — " + data.detail : ""}`);
+    } else if (event === "progress") {
       const p = data.rea_progress || {};
-      const pct = p.total ? ` ${Math.round(((p.completed || 0) / p.total) * 100)}%` : "";
-      $("#progress").textContent += `${p.message || p.phase || ""}${pct}\n`;
-      $("#progress").scrollTop = $("#progress").scrollHeight;
+      const pct = p.total ? Math.round(((p.completed || 0) / p.total) * 100) : null;
+      setProgressBar(pct);
+      const label = p.message || p.phase || "";
+      if (label) setStageText(label, pct == null ? $("#pbDetail").textContent : `已完成 ${pct}%`);
+      appendLog(`${label}${pct == null ? "" : " " + pct + "%"}`);
+    } else if (event === "tick") {
+      // Heartbeat: this command prints nothing while it works, so the elapsed
+      // clock is what proves the run is still alive.
+      if (typeof data.elapsedMs === "number") {
+        $("#pbTime").textContent = fmtElapsed(data.elapsedMs);
+        setStatus(`运行中 ${fmtElapsed(data.elapsedMs)}`, "run");
+      }
+      if (data.stage) setStageText(data.stage, data.note);
     } else if (event === "result") {
       state.lastResult = data;
       renderOutput();
-      // REA reports unavailable providers / unsupported targets as a normal
-      // result with a remediation hint and a non-zero exit. Surfacing it here
-      // is far more useful than a bare exit code.
-      if (data.remediation) {
-        addNotice("需要外部引擎", `${data.remediation.action || ""}\n\n${
-          data.reason ? "原因：" + data.reason + "\n" : ""
-        }${formatRejections(data.details?.rejections)}`);
-      }
+      // REA reports failures as a normal result envelope (with a code and a
+      // remediation hint) rather than a crash. Classify it so the banner says
+      // what actually went wrong instead of always blaming a missing engine.
+      const notice = describeEnvelopeError(data);
+      if (notice) addNotice(notice.title, notice.body);
     } else if (event === "log" || event === "stderr") {
-      $("#progress").textContent += (data.line || "") + "\n";
-      $("#progress").scrollTop = $("#progress").scrollHeight;
+      appendLog(data.line || "");
     } else if (event === "failed") {
       $("#output").textContent = String(data.error || "");
       setStatus("出错", "err");
@@ -351,12 +443,41 @@ class EventSourcePlaceholder {
   }
   finish(code) {
     state.running = false;
+    stopElapsedTimer();
     $("#runBtn").classList.remove("hidden");
     $("#stopBtn").classList.add("hidden");
-    if (code === 0) setStatus("完成", "ok");
-    else setStatus(`退出码 ${code}`, "err");
+    const box = $("#progressBox");
+    const fill = $("#pbFill");
+    if (code === "stopped") {
+      box.classList.add("cancelled");
+      fill.className = "pb-fill stopped";
+      setStatus("已停止", "");
+      setStageText("已取消", "已终止 REA 进程及其 Ghidra 子进程");
+      return;
+    }
+    if (code === 0) {
+      box.classList.add("done");
+      fill.className = "pb-fill full";
+      setStatus("完成", "ok");
+    } else {
+      box.classList.add("cancelled");
+      fill.className = "pb-fill stopped";
+      setStatus(`退出码 ${code}`, "err");
+    }
   }
   stop() {
+    if (state.running) {
+      setStageText("正在取消…", "已发送终止信号，正在回收 Ghidra 子进程");
+    }
+    // Explicit cancel, so the server tears the process tree down even if this
+    // page is closed before the aborted request is noticed.
+    if (state.runId) {
+      fetch("/api/cancel", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ runId: state.runId }),
+      }).catch(() => {});
+    }
     this.controller.abort();
     this.finish("stopped");
   }
@@ -371,6 +492,59 @@ function formatRejections(rejections) {
       return `  · ${id}: ${reason}`;
     })
     .join("\n");
+}
+
+// Turn a REA failure envelope into a title + explanation for the UI banner.
+// Returns null for a successful envelope so the caller can skip the banner.
+function describeEnvelopeError(data) {
+  if (!data || typeof data !== "object") return null;
+  const code = data.code || data.error_code;
+  const isError =
+    code ||
+    data.remediation ||
+    (Array.isArray(data.details?.issues) && data.details.issues.length);
+  if (!isError) return null;
+
+  const lines = [];
+  const msg = data.message || data.reason || "";
+  if (msg) lines.push(msg);
+
+  // `issues` carries the precise, actionable part (which argument, why).
+  const issues = data.details?.issues;
+  if (Array.isArray(issues) && issues.length) {
+    lines.push("", "需要修正：");
+    for (const it of issues.slice(0, 8)) {
+      const where = Array.isArray(it.path) ? it.path.join(".") : it.path || "";
+      lines.push(`  · ${where ? where + "：" : ""}${it.message || it.reason || ""}`);
+    }
+  }
+  const rejections = formatRejections(data.details?.rejections);
+  if (rejections) lines.push("", rejections);
+  if (data.remediation?.action && !issues?.length) lines.push("", "建议：" + data.remediation.action);
+
+  // Commands such as decompile/function/xrefs need a selector; REA reports the
+  // missing argument as an invalid_input envelope. Give the specific hint first
+  // so it is not swallowed by the generic branch below.
+  const needsSelector = Array.isArray(issues) &&
+    issues.some((it) => it.reason === "missing_argument");
+  if (needsSelector) {
+    return {
+      title: "缺少定位参数",
+      body: lines.join("\n") +
+        "\n\n提示：decompile / function / instructions / xrefs 需要一个函数名或地址，请填写「address」参数，或使用「procedure」选项。",
+    };
+  }
+
+  if (code === "invalid_request" || code === "invalid_input") {
+    return { title: "参数有误", body: lines.join("\n") };
+  }
+  if (code === "provider_unavailable" || code === "engine_unavailable") {
+    return { title: "需要外部引擎", body: lines.join("\n") };
+  }
+  if (code === "unsupported_target" || code === "unsupported_format") {
+    return { title: "不支持的目标", body: lines.join("\n") };
+  }
+  return { title: code ? `执行失败（${code}）` : "执行失败", body: lines.join("\n") || "命令未能完成。" };
 }
 
 // A dismissible banner above the output area explaining why a run could not
@@ -391,13 +565,48 @@ function addNotice(title, body) {
 function renderOutput() {
   const r = state.lastResult;
   if (!r) return;
+  // Error envelopes are meant to be read, not parsed: render the message and
+  // the offending arguments as plain text instead of a wall of JSON.
+  if (r.code && !r.raw_result && !r.normalized_result) {
+    $("#output").textContent = formatErrorEnvelopeText(r);
+    return;
+  }
   if (state.outTab === "result") {
-    $("#output").textContent = JSON.stringify(collapse(r), null, 2);
+    const text = primaryText(r);
+    $("#output").textContent = text != null ? text : JSON.stringify(collapse(r), null, 2);
   } else if (state.outTab === "evidence") {
     $("#output").textContent = extractEvidence(r);
   } else {
     $("#output").textContent = JSON.stringify(r, null, 2);
   }
+}
+
+// Commands such as decompile return the interesting artefact (pseudo-code) as a
+// multi-line string inside normalized_result. Show that directly instead of
+// wrapping it in an escaped JSON envelope the user has to read around.
+function primaryText(r) {
+  const candidates = [r.normalized_result, r.raw_result && r.raw_result.value];
+  for (const v of candidates) {
+    if (typeof v === "string" && v.includes("\n") && v.trim().length > 60) return v;
+  }
+  return null;
+}
+
+function formatErrorEnvelopeText(r) {
+  const out = [`状态：失败（${r.code || "unknown"}）`];
+  if (r.message) out.push("", r.message);
+  const issues = r.details?.issues;
+  if (Array.isArray(issues) && issues.length) {
+    out.push("", "需要修正：");
+    for (const it of issues) {
+      const where = Array.isArray(it.path) ? it.path.join(".") : it.path || "";
+      out.push(`  · ${where ? where + "：" : ""}${it.message || it.reason || ""}`);
+    }
+  }
+  const rej = formatRejections(r.details?.rejections);
+  if (rej) out.push("", rej);
+  if (r.remediation?.action) out.push("", "建议：" + r.remediation.action);
+  return out.join("\n");
 }
 
 // Keep the default view readable: REA envelopes are large, so show the shape
@@ -483,19 +692,75 @@ async function sendChat() {
   addMsg("user", text);
   state.chat.push({ role: "user", content: text });
 
+  // The answer can take minutes (every REA command re-imports the binary into
+  // Ghidra), so the bubble reports the live round/command instead of "thinking".
   const pending = addMsg("assistant", "思考中…");
+  const started = Date.now();
+  let note = "正在请求模型…";
+  let round = 0;
+  const paint = () => {
+    if (!pending.isConnected) return;
+    pending.textContent = `${fmtElapsed(Date.now() - started)}  ${note}`;
+  };
+  paint();
+  const ticker = setInterval(paint, 1000);
+
   try {
     const res = await fetch("/api/chat", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ messages: state.chat, ...cfg }),
+      body: JSON.stringify({ messages: state.chat, ...cfg, stream: true }),
     });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    if (!res.ok || !res.body) {
+      const d = await res.json().catch(() => ({}));
+      throw new Error(d.error || `HTTP ${res.status}`);
+    }
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    let finalReply = null;
+    let streamError = null;
+
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf("\n\n")) >= 0) {
+        const frame = buf.slice(0, i);
+        buf = buf.slice(i + 2);
+        const ev = frame.split("\n").find((l) => l.startsWith("event: "))?.slice(7);
+        const dl = frame.split("\n").find((l) => l.startsWith("data: "));
+        if (!dl) continue;
+        let d;
+        try { d = JSON.parse(dl.slice(6)); } catch { continue; }
+
+        if (ev === "chat_round") {
+          round = d.round;
+          note = `第 ${d.round}/${d.maxRounds} 轮：模型正在决定下一步…`;
+        } else if (ev === "chat_exec") {
+          note = `第 ${d.round} 轮：正在执行 ${d.command}`;
+        } else if (ev === "chat_exec_done") {
+          note = d.error
+            ? `第 ${round} 轮：命令失败，模型正在调整…`
+            : `第 ${round} 轮：命令完成（${(d.ms / 1000).toFixed(0)}s），模型正在整理…`;
+        } else if (ev === "chat_final") {
+          finalReply = d.reply || "";
+        } else if (ev === "chat_error") {
+          streamError = d.error || "未知错误";
+        }
+        paint();
+      }
+    }
+
+    clearInterval(ticker);
     pending.remove();
-    addMsg("assistant", data.reply);
-    state.chat.push({ role: "assistant", content: data.reply });
+    if (streamError) throw new Error(streamError);
+    if (finalReply == null) throw new Error("连接中断，未收到模型回复");
+    addMsg("assistant", finalReply);
+    state.chat.push({ role: "assistant", content: finalReply });
   } catch (e) {
+    clearInterval(ticker);
     pending.remove();
     addMsg("error", String(e.message || e), true);
   }
@@ -584,6 +849,14 @@ async function boot() {
 $("#search").addEventListener("input", (e) => renderList(e.target.value));
 $("#runBtn").addEventListener("click", run);
 $("#stopBtn").addEventListener("click", () => state.es?.stop());
+// The progress card carries its own cancel button so the run can be stopped
+// without scrolling back up to the toolbar.
+$("#pbCancel").addEventListener("click", () => state.es?.stop());
+$("#pbToggle").addEventListener("click", () => {
+  const log = $("#progress");
+  const nowHidden = log.classList.toggle("hidden");
+  $("#pbToggle").textContent = nowHidden ? "详情" : "收起";
+});
 $("#copyBtn").addEventListener("click", async () => {
   if (!state.lastResult) return;
   await navigator.clipboard.writeText(JSON.stringify(state.lastResult, null, 2));
