@@ -77,7 +77,21 @@
             <button id="saveBtn" class="ghost small-btn">保存 JSON</button>
           </div>
         </div>
-        <pre id="progress" class="progress hidden"></pre>
+        <!-- 进度卡片：阶段来自服务端真实信号（REA 子进程 + Ghidra java.exe） -->
+        <div id="progressBox" class="progress-box hidden">
+          <div class="pb-row">
+            <span id="pbSpinner" class="pb-spinner" aria-hidden="true"></span>
+            <span id="pbStage" class="pb-stage">准备中…</span>
+            <span id="pbTime" class="pb-time">00:00</span>
+            <span class="pb-tools">
+              <button id="pbToggle" class="ghost small-btn">详情</button>
+              <button id="pbCancel" class="ghost small-btn">取消</button>
+            </span>
+          </div>
+          <div class="pb-track"><div id="pbFill" class="pb-fill indeterminate"></div></div>
+          <div id="pbDetail" class="pb-detail"></div>
+          <pre id="progress" class="progress hidden"></pre>
+        </div>
         <pre id="output" class="out-body">尚未运行。</pre>
       </section>
     </section>
