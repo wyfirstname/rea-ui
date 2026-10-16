@@ -16,12 +16,9 @@ REA 是 [morluto/rea](https://github.com/morluto/rea) —— 一个 20 万星的
 
 <table>
 <tr>
-<td align="center"><img src="assets/qrcode-green-package.png" width="260" alt="公众号文章二维码:获取绿色安装包"><br><b>扫码获取绿色安装包</b></td>
+<td align="center"><img src="assets/qrcode-green-package.png" width="260" alt="扫码获取绿色安装包"><br><b>扫码获取绿色安装包</b></td>
 </tr>
 </table>
-
-在电脑上阅读,直接打开这篇文章即可:
-<https://mp.weixin.qq.com/s/EprMLmF2G-krsqQGI8psfg>
 
 ---
 
