@@ -10,6 +10,7 @@
 //
 // Usage: node tools/build-portable.mjs [--node <path-to-node-dir>]
 import { cpSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -119,6 +120,13 @@ for (const f of [
 }
 cpSync(join(root, "public"), join(STAGE, "public"), { recursive: true });
 cpSync(join(root, "tools"), join(STAGE, "tools"), { recursive: true });
+
+// Blog/announcement tooling is not part of the shipped product and must not
+// ride along in the package (nor in the published repository).
+for (const f of ["build-blog-html.mjs"]) {
+  const p = join(STAGE, "tools", f);
+  if (existsSync(p)) rmSync(p, { force: true });
+}
 
 // Ghidra loads headless scripts as compiled classes; without the .class the
 // batch decompile script fails at runtime. Compile it here when javac and a
